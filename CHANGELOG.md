@@ -19,6 +19,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Residual stream flush was emitted after `finish_reason`, breaking strict
+  clients.** The sliding-window mask buffer holds back the tail of every streamed
+  response (up to `_MASK_KEEP` = 256 chars, i.e. the whole answer for short
+  replies), and that residual was yielded as a synthetic `ceil-dlp-flush` chunk
+  *after* the upstream terminal `finish_reason` chunk. It also used
+  `object: chat.completion` with a `message` field instead of a stream delta.
+  Strict OpenAI-compatible consumers such as the Vercel AI SDK used by OpenCode
+  v2 reject content after a finish reason (`InvalidProviderOutput: received
+  content after the finish reason`), so completions aborted. The generator now
+  holds terminal chunks back until the source is exhausted, emits the residual as
+  a proper `chat.completion.chunk` **before** them, and only then releases the
+  terminal chunk(s).
 - **Per-message masking/whistledown silently failed with multiple messages.**
   The base `async_pre_call_hook` joins all message text, runs detection/redaction
   on the joined blob, then does `content.replace(joined, redacted)` per message —

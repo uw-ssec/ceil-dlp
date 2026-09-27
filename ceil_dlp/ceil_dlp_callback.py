@@ -28,6 +28,8 @@ import json
 import os
 import re
 import threading
+import time
+from collections.abc import AsyncIterable, AsyncIterator, Callable
 from pathlib import Path
 from typing import Any, Literal
 
@@ -418,6 +420,81 @@ _instance = _PatchedCeilDLPHandler(_inner)
 proxy_handler_instance = _instance  # noqa: F401  # type: ignore[unused-import]
 
 
+# --- Stream ordering helpers ----------------------------------------------
+def _chunk_has_finish_reason(chunk: Any) -> bool:
+    """Return True when a streaming chunk carries a non-null ``finish_reason``.
+
+    Accepts a serialized JSON string, a mapping, or an object exposing
+    ``choices`` so it can be used both before and after serialization.
+    """
+    if isinstance(chunk, (str, bytes)):
+        try:
+            chunk = json.loads(chunk)
+        except (TypeError, ValueError):
+            return False
+
+    choices = chunk.get("choices") if isinstance(chunk, dict) else getattr(chunk, "choices", None)
+
+    for choice in choices or []:
+        if isinstance(choice, dict):
+            finish_reason = choice.get("finish_reason")
+        else:
+            finish_reason = getattr(choice, "finish_reason", None)
+        if finish_reason:
+            return True
+    return False
+
+
+def _build_flush_chunk(content: str, model: str | None = None) -> str:
+    """Build a valid OpenAI streaming chunk carrying residual buffered content.
+
+    This is emitted *before* the terminal ``finish_reason`` chunk. It uses
+    ``object: chat.completion.chunk`` and a null ``finish_reason`` so strict
+    stream consumers treat it as a normal content delta.
+    """
+    payload: dict[str, Any] = {
+        "id": "ceil-dlp-flush",
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "choices": [
+            {"index": 0, "delta": {"content": content}, "finish_reason": None}
+        ],
+    }
+    if model:
+        payload["model"] = model
+    return json.dumps(payload, ensure_ascii=False)
+
+
+async def _reorder_stream_for_strict_clients(
+    chunks: AsyncIterable[Any],
+    flush: Callable[[], str],
+    make_flush_chunk: Callable[[str], str],
+) -> AsyncIterator[Any]:
+    """Yield ``chunks`` reordered so no content follows a ``finish_reason``.
+
+    The sliding-window mask buffer holds back the tail of every streamed
+    response, which is emitted as a residual chunk at end-of-stream. Yielding
+    that residual *after* the upstream terminal ``finish_reason`` chunk violates
+    the OpenAI streaming contract and strict consumers (for example the Vercel
+    AI SDK used by OpenCode v2) abort with "received content after the finish
+    reason". Terminal chunks are therefore held back until the source is
+    exhausted; the residual is emitted first, then the terminal chunk(s).
+    """
+    terminal: list[Any] = []
+    async for chunk in chunks:
+        if _chunk_has_finish_reason(chunk):
+            terminal.append(chunk)
+            continue
+        yield chunk
+
+    residual = flush()
+    if residual:
+        yield make_flush_chunk(residual)
+
+    for chunk in terminal:
+        yield chunk
+
+
 # --- Streaming whistledown reversal ---------------------------------------
 # LiteLLM v1.63.x discards callback return values in async_post_call_streaming_hook
 # (proxy/utils.py always returns the original chunk). We instead replace
@@ -468,7 +545,8 @@ def _ensure_data_generator_patched() -> None:
                 request_data.get("model", "") if isinstance(request_data, dict) else ""
             )
             stream_user = getattr(user_api_key_dict, "user_id", None)
-            try:
+
+            async def _serialized_chunks():
                 async for chunk in response:
                     if hasattr(chunk, "choices"):
                         _instance._transform_chunk_inplace(
@@ -483,25 +561,27 @@ def _ensure_data_generator_patched() -> None:
 
                     if isinstance(chunk, _BaseModel):
                         chunk = chunk.model_dump_json(exclude_none=True, exclude_unset=True)
+                    yield chunk
 
-                    try:
-                        yield f"data: {chunk}\n\n"
-                    except Exception as e:
-                        yield f"data: {str(e)}\n\n"
-
-                # Flush any residual buffered (masked/reversed) text before [DONE].
-                # Always run: the masking buffer is keyed on "_fallback" when the
-                # request has no whistledown id, and its tail must not be lost.
+            def _flush_residual() -> str:
+                # Always flush: the masking buffer is keyed on "_fallback" when
+                # the request has no whistledown id, and its tail must not be
+                # lost. Emitted before any terminal finish_reason chunk.
                 leftover = _instance.flush_streaming_buffers(rid)
                 _instance._inner.clear_response_audit_state(rid)
-                if leftover:
-                    from litellm.types.utils import Delta, ModelResponse, StreamingChoices
+                return leftover
 
-                    final = ModelResponse(
-                        id="ceil-dlp-flush",
-                        choices=[StreamingChoices(delta=Delta(content=leftover))],
-                    )
-                    yield f"data: {final.model_dump_json(exclude_none=True, exclude_unset=True)}\n\n"
+            try:
+                # Keep the terminal finish_reason chunk(s) until after the
+                # residual buffer is flushed: emitting content after a finish
+                # reason breaks strict clients (e.g. the Vercel AI SDK used by
+                # OpenCode v2 raises "received content after the finish reason").
+                async for serialized in _reorder_stream_for_strict_clients(
+                    _serialized_chunks(),
+                    _flush_residual,
+                    lambda content: _build_flush_chunk(content, stream_model),
+                ):
+                    yield f"data: {serialized}\n\n"
 
                 yield "data: [DONE]\n\n"
             except Exception as e:

@@ -1,8 +1,15 @@
 """Tests for ceil_dlp_callback module."""
 
+import asyncio
 import importlib
+import json
 
-from ceil_dlp.ceil_dlp_callback import proxy_handler_instance
+from ceil_dlp.ceil_dlp_callback import (
+    _build_flush_chunk,
+    _chunk_has_finish_reason,
+    _reorder_stream_for_strict_clients,
+    proxy_handler_instance,
+)
 from ceil_dlp.middleware import CeilDLPHandler
 
 
@@ -63,3 +70,85 @@ def test_callback_module_with_invalid_config_path(monkeypatch):
     # Clean up
     monkeypatch.delenv("CEIL_DLP_CONFIG_PATH", raising=False)
     importlib.reload(ceil_dlp.ceil_dlp_callback)
+
+
+def test_chunk_has_finish_reason():
+    """Detect terminal chunks in serialized, dict, and object forms."""
+    assert _chunk_has_finish_reason('{"choices":[{"finish_reason":"stop"}]}')
+    assert _chunk_has_finish_reason('{"choices":[{"finish_reason":"length"}]}')
+    assert not _chunk_has_finish_reason('{"choices":[{"finish_reason":null}]}')
+    assert not _chunk_has_finish_reason('{"choices":[{"delta":{"content":"hi"}}]}')
+    assert _chunk_has_finish_reason({"choices": [{"finish_reason": "stop"}]})
+    assert not _chunk_has_finish_reason({"choices": [{"delta": {}}]})
+    assert not _chunk_has_finish_reason("not json")
+
+
+def test_build_flush_chunk_is_valid_streaming_chunk():
+    """The residual flush must be a normal stream delta, not a full completion."""
+    chunk = json.loads(_build_flush_chunk("tail", model="test-model"))
+    assert chunk["object"] == "chat.completion.chunk"
+    assert chunk["model"] == "test-model"
+    assert chunk["choices"][0]["delta"]["content"] == "tail"
+    assert chunk["choices"][0]["finish_reason"] is None
+    # A full completion object here would be mistaken for a non-stream payload.
+    assert "message" not in chunk["choices"][0]
+
+
+def test_reorder_puts_flush_before_finish_reason():
+    """No content may be emitted after a finish_reason chunk."""
+    content = '{"choices":[{"delta":{"content":"Hello"}}]}'
+    finish = '{"choices":[{"delta":{},"finish_reason":"stop"}]}'
+    usage = '{"choices":[{"delta":{}}],"usage":{"total_tokens":5}}'
+
+    async def source():
+        yield content
+        yield finish
+        yield usage
+
+    async def scenario():
+        return [
+            chunk
+            async for chunk in _reorder_stream_for_strict_clients(
+                source(),
+                lambda: " tail",
+                lambda text: json.dumps(
+                    {"choices": [{"delta": {"content": text}, "finish_reason": None}]}
+                ),
+            )
+        ]
+
+    out = asyncio.run(scenario())
+
+    # Content first, then any non-terminal chunk, then the flush, then finish.
+    assert out[0] == content
+    assert out[1] == usage
+    assert json.loads(out[2])["choices"][0]["delta"]["content"] == " tail"
+    assert out[3] == finish
+
+    seen_finish = False
+    for serialized in out:
+        choice = json.loads(serialized)["choices"][0]
+        assert not (seen_finish and choice.get("delta", {}).get("content"))
+        if choice.get("finish_reason"):
+            seen_finish = True
+    assert seen_finish
+
+
+def test_reorder_keeps_finish_terminal_without_residual():
+    """With nothing buffered the finish_reason chunk still comes last."""
+
+    async def source():
+        yield '{"choices":[{"delta":{"content":"Hi"}}]}'
+        yield '{"choices":[{"delta":{},"finish_reason":"stop"}]}'
+
+    async def scenario():
+        return [
+            chunk
+            async for chunk in _reorder_stream_for_strict_clients(
+                source(), lambda: "", lambda text: text
+            )
+        ]
+
+    out = asyncio.run(scenario())
+    assert _chunk_has_finish_reason(out[-1])
+    assert not _chunk_has_finish_reason(out[0])
