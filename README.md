@@ -64,6 +64,32 @@ ceil-dlp remove path/to/config.yaml
 
 This will remove the callback from your LiteLLM config. You can also use `--remove-callback-file` and `--remove-config-file` flags to remove the generated files.
 
+### As a LiteLLM guardrail
+
+On LiteLLM versions with the unified guardrail interface, ceil-dlp can run as a
+guardrail instead of a callback: it then shows up among LiteLLM's guardrails, and
+nothing in LiteLLM is patched to handle streamed replies. Put a one-line module
+next to your LiteLLM config:
+
+```python
+# ceil_dlp_guardrail.py
+from ceil_dlp.guardrail import CeilDLPGuardrail  # noqa: F401
+```
+
+and register it instead of the callback:
+
+```yaml
+guardrails:
+  - guardrail_name: ceil-dlp
+    litellm_params:
+      guardrail: ceil_dlp_guardrail.CeilDLPGuardrail
+      mode: [pre_call, post_call]
+      default_on: true
+```
+
+It reads the same `ceil-dlp.yaml` (`CEIL_DLP_CONFIG_PATH`). Text only, and
+`reasoning_content` is not rewritten; see `ceil_dlp/guardrail.py`.
+
 ## Documentation
 
 - See the [Quick Start Guide](docs/ollama_guide.md) for a comprehensive, step-by-step tutorial with Ollama
