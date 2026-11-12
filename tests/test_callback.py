@@ -7,6 +7,7 @@ import json
 from ceil_dlp.ceil_dlp_callback import (
     _build_flush_chunk,
     _chunk_has_finish_reason,
+    _PatchedCeilDLPHandler,
     _reorder_stream_for_strict_clients,
     proxy_handler_instance,
 )
@@ -85,13 +86,33 @@ def test_chunk_has_finish_reason():
 
 def test_build_flush_chunk_is_valid_streaming_chunk():
     """The residual flush must be a normal stream delta, not a full completion."""
-    chunk = json.loads(_build_flush_chunk("tail", model="test-model"))
+    chunk = json.loads(_build_flush_chunk('{"content": "tail"}', model="test-model"))
     assert chunk["object"] == "chat.completion.chunk"
     assert chunk["model"] == "test-model"
-    assert chunk["choices"][0]["delta"]["content"] == "tail"
+    assert chunk["choices"][0]["delta"] == {"content": "tail"}
     assert chunk["choices"][0]["finish_reason"] is None
     # A full completion object here would be mistaken for a non-stream payload.
     assert "message" not in chunk["choices"][0]
+
+
+def test_flush_keeps_reasoning_out_of_the_answer():
+    """A reasoning model's held-back thinking must not be flushed as content."""
+    handler = _PatchedCeilDLPHandler(CeilDLPHandler())
+    handler._stream_buffers["req-1:content"] = "the answer"
+    handler._stream_buffers["req-1:reasoning"] = "the thinking"
+
+    residual = handler.flush_streaming_buffers("req-1")
+    assert json.loads(residual) == {"reasoning_content": "the thinking", "content": "the answer"}
+    delta = json.loads(_build_flush_chunk(residual))["choices"][0]["delta"]
+    assert delta["content"] == "the answer"
+    assert delta["reasoning_content"] == "the thinking"
+
+    # Nothing buffered: no flush chunk at all.
+    assert handler.flush_streaming_buffers("req-1") == ""
+
+    handler._stream_buffers["req-2:reasoning"] = "only thinking"
+    delta = json.loads(_build_flush_chunk(handler.flush_streaming_buffers("req-2")))["choices"][0]["delta"]
+    assert delta == {"reasoning_content": "only thinking"}
 
 
 def test_reorder_puts_flush_before_finish_reason():

@@ -139,10 +139,16 @@ class _PatchedCeilDLPHandler(CustomLogger):
         return result[:-keep_len] if keep_len else result
 
     def flush_streaming_buffers(self, request_id: str | None) -> str:
-        """Flush and reverse any residual buffered text at stream end."""
-        parts: list[str] = []
+        """Flush and reverse any residual buffered text at stream end.
+
+        Returns a JSON object with the residual of each field (``content``,
+        ``reasoning_content``), or an empty string when nothing is buffered.
+        The two must stay apart: joined into one string, the held-back tail of
+        a reasoning model's thinking would be emitted as part of its answer.
+        """
+        parts: dict[str, str] = {}
         rid = request_id or "_fallback"
-        for field in (":content", ":reasoning"):
+        for field, name in ((":reasoning", "reasoning_content"), (":content", "content")):
             key = rid + field
             buf = self._stream_buffers.pop(key, "")
             if not buf:
@@ -155,8 +161,8 @@ class _PatchedCeilDLPHandler(CustomLogger):
                 tokens = sorted(replacements.keys(), key=len, reverse=True)
                 pattern = re.compile("|".join(re.escape(t) for t in tokens))
                 buf = pattern.sub(lambda m: replacements[m.group()], buf)
-            parts.append(buf)
-        return "".join(parts)
+            parts[name] = buf
+        return json.dumps(parts, ensure_ascii=False) if parts else ""
 
     def _reverse_chunk_inplace(self, chunk: Any, request_id: str) -> None:
         try:
@@ -445,8 +451,11 @@ def _chunk_has_finish_reason(chunk: Any) -> bool:
     return False
 
 
-def _build_flush_chunk(content: str, model: str | None = None) -> str:
+def _build_flush_chunk(residual: str, model: str | None = None) -> str:
     """Build a valid OpenAI streaming chunk carrying residual buffered content.
+
+    ``residual`` is what ``flush_streaming_buffers`` returned: a JSON object
+    with ``content`` and/or ``reasoning_content``, used as the chunk's delta.
 
     This is emitted *before* the terminal ``finish_reason`` chunk. It uses
     ``object: chat.completion.chunk`` and a null ``finish_reason`` so strict
@@ -457,7 +466,7 @@ def _build_flush_chunk(content: str, model: str | None = None) -> str:
         "object": "chat.completion.chunk",
         "created": int(time.time()),
         "choices": [
-            {"index": 0, "delta": {"content": content}, "finish_reason": None}
+            {"index": 0, "delta": json.loads(residual), "finish_reason": None}
         ],
     }
     if model:
